@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RFID Supabase Request Test</title>
+<style>
+:root{--bg:#f3f6f4;--card:#fff;--text:#1f2937;--muted:#6b7280;--border:#e0e6e2;--primary:#15803d}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:15px}
+main{max-width:640px;margin:0 auto;padding:12px}
+h1{font-size:1.1rem;margin:4px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:12px}
+.note{font-size:.78rem;color:var(--muted);margin:6px 0}
+label{display:block;font-size:.85rem;margin:8px 0 4px}
+input[type=text]{width:100%;font:inherit;padding:10px;border:1px solid var(--border);border-radius:8px;min-height:44px}
+button{font:inherit;border:1px solid var(--border);background:#fff;padding:10px 12px;border-radius:8px;min-height:44px;cursor:pointer;margin:6px 6px 0 0}
+button.p{background:var(--primary);color:#fff;border-color:var(--primary)}
+button:disabled{opacity:.5}
+.chk{display:flex;gap:8px;align-items:center;font-size:.85rem;margin-top:10px}
+#log{background:#0b120e;color:#b7f5c6;font-family:monospace;font-size:.72rem;padding:10px;border-radius:8px;min-height:220px;max-height:380px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+#log .ok{color:#86efac}#log .err{color:#fca5a5}#log .warn{color:#fcd34d}
+</style>
+</head>
+<body>
+<main>
+<h1>RFID Supabase Request Test</h1>
+<div class="card">
+  <div class="note">Sends the same requests the ESP32 will send. Uses the publishable key only. Insert tests create REAL attendance rows.</div>
+  <label for="uid">Test card UID</label>
+  <input type="text" id="uid" placeholder="EB:23:D1:3E" autocapitalize="characters">
+  <div class="chk"><input type="checkbox" id="sendTime"><label for="sendTime" style="margin:0">Send scan_time from device (tick only if the insert fails because scan_time is required)</label></div>
+  <div>
+    <button id="btnConn">1. Connection</button>
+    <button id="btnLookup">2. Lookup UID</button>
+    <button class="p" id="btnScan">3. Record scan</button>
+    <button id="btnDup">4. Scan again (duplicate)</button>
+  </div>
+  <div class="note">Expected: 1 → 200. 2 → student found (active). 3 → 201 with status Present/Late. 4 → 409 duplicate.</div>
+</div>
+<div class="card">
+  <div id="log"></div>
+  <button id="btnClear">Clear log</button>
+</div>
+</main>
+<script>
+const SUPABASE_URL = "https://zepbgjlliklvwyipahin.supabase.co";
+const SUPABASE_API = SUPABASE_URL + "/rest/v1";
+const SUPABASE_KEY = "sb_publishable_HJYQXc8ZnQMJBhxHzxAp6Q_dMtY1NwW";
+const SCANNER_LOCATION = "Main Entrance";
+const TIMEOUT_MS = 10000;
+
+const $ = id => document.getElementById(id);
+function log(msg, cls) {
+  const d = document.createElement("div");
+  if (cls) d.className = cls;
+  d.textContent = msg;
+  $("log").appendChild(d);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+function normalizeUID(uid) {
+  let s = uid.trim().toUpperCase().replace(/[-\s]/g, ":");
+  if (/^[0-9A-F]{8}$/.test(s)) s = s.match(/.{2}/g).join(":");
+  return s;
+}
+
+async function api(path, options = {}) {
+  let timer;
+  const timeout = new Promise((_, rej) => {
+    timer = setTimeout(() => rej(Object.assign(new Error("timeout"), { name: "AbortError" })), TIMEOUT_MS);
+  });
+  try {
+    const request = (async () => {
+      const res = await fetch(SUPABASE_API + path, {
+        ...options,
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: "Bearer " + SUPABASE_KEY,
+          "Content-Type": "application/json",
+          ...(options.headers || {})
+        }
+      });
+      const text = await res.text();
+      let body; try { body = text ? JSON.parse(text) : null; } catch (e) { body = text; }
+      return { ok: res.ok, status: res.status, body };
+    })();
+    return await Promise.race([request, timeout]);
+  } finally { clearTimeout(timer); }
+}
+function show(r) { log("HTTP " + r.status + " " + JSON.stringify(r.body), r.ok ? "ok" : "err"); }
+function hint(r) {
+  if (r.status === 401) log("→ Key problem (apikey/Authorization).", "warn");
+  else if (r.status === 403 || (r.body && r.body.code === "42501")) log("→ RLS is blocking this operation for the anon key.", "warn");
+  else if (r.status === 404) log("→ Wrong table/endpoint name.", "warn");
+  else if (r.body && r.body.code === "23502") log("→ A required column is missing. Tick 'Send scan_time' and retry.", "warn");
+}
+function busy(b) { document.querySelectorAll("button").forEach(x => x.disabled = b); }
+async function run(fn) {
+  busy(true);
+  try { await fn(); }
+  catch (e) { log(e.name === "AbortError" ? "Timed out (server unreachable)." : "Network error: " + e.message, "err"); }
+  busy(false);
+}
+
+async function testConnection() {
+  log("GET /sections?select=id&limit=1");
+  const r = await api("/sections?select=id&limit=1"); show(r); hint(r);
+}
+async function findStudent() {
+  const uid = normalizeUID($("uid").value);
+  if (!uid) { log("Enter a UID first.", "warn"); return null; }
+  $("uid").value = uid;
+  log("GET /students?rfid_uid=eq." + uid);
+  const r = await api("/students?select=id,student_id,name,active,rfid_uid&rfid_uid=eq." + encodeURIComponent(uid));
+  show(r); hint(r);
+  if (!r.ok) return null;
+  if (!r.body.length) { log("Result: UNKNOWN RFID CARD (no attendance would be created).", "warn"); return null; }
+  const s = r.body[0];
+  if (!s.active) { log("Result: STUDENT INACTIVE for " + s.name + " (no attendance would be created).", "warn"); return null; }
+  log("Result: found " + s.name + " (id " + s.id + ", active).", "ok");
+  return s;
+}
+async function recordScan() {
+  const s = await findStudent();
+  if (!s) return;
+  const payload = { student_id: s.id, scanner_location: SCANNER_LOCATION };
+  if ($("sendTime").checked) payload.scan_time = new Date().toISOString();
+  log("POST /attendance " + JSON.stringify(payload));
+  const r = await api("/attendance", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(payload) });
+  show(r); hint(r);
+  if (r.status === 201) log("Result: ATTENDANCE RECORDED, status = " + (r.body[0] && r.body[0].status), "ok");
+  else if (r.status === 409 || (r.body && r.body.code === "23505")) log("Result: ALREADY RECORDED (duplicate blocked by database).", "warn");
+  else log("Result: SERVER ERROR (ESP32 must not show success).", "err");
+}
+
+$("btnConn").addEventListener("click", () => run(testConnection));
+$("btnLookup").addEventListener("click", () => run(findStudent));
+$("btnScan").addEventListener("click", () => run(recordScan));
+$("btnDup").addEventListener("click", () => run(recordScan));
+$("btnClear").addEventListener("click", () => { $("log").textContent = ""; });
+log("Ready. Project: zepbgjlliklvwyipahin");
+</script>
+</body>
+</html>
